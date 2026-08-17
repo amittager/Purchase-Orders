@@ -8,13 +8,18 @@ import { cn } from "@/lib/utils";
 export function NavLinks({ isApprover }: { isApprover: boolean }) {
   const pathname = usePathname();
 
-  const links = [
-    { href: "/orders", label: "My Orders" },
-    { href: "/orders/new", label: "New Order" },
-    ...(isApprover
-      ? [{ href: "/approvals", label: "All Pending Approvals" }]
-      : []),
-  ];
+  // Approvers see "All Pending Approvals" first — that's the thing they're
+  // actually here to act on; "My Orders"/"New Order" are secondary for them.
+  const links = isApprover
+    ? [
+        { href: "/approvals", label: "All Pending Approvals" },
+        { href: "/orders", label: "My Orders" },
+        { href: "/orders/new", label: "New Order" },
+      ]
+    : [
+        { href: "/orders", label: "My Orders" },
+        { href: "/orders/new", label: "New Order" },
+      ];
 
   return (
     <nav className="flex items-center gap-1">

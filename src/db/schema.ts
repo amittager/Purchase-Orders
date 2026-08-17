@@ -81,8 +81,10 @@ export const purchaseOrders = pgTable(
     decisionNotes: text("decision_notes"),
     decidedAt: timestamp("decided_at", { withTimezone: true }),
 
-    // Populated only on approval: the PDF approval receipt (stamped with
-    // the "APPROVED" icon).
+    // Populated only on approval: the requester's own quote file
+    // (`quoteFileKey`/`quoteFileName`), converted to PDF if it wasn't one
+    // already, with the "APPROVED" stamp icon + sign-off date drawn onto
+    // its last page — see `stampApprovalOnQuoteFile` in `receipt-pdf.ts`.
     signedReceiptKey: text("signed_receipt_key"),
 
     createdAt: timestamp("created_at", { withTimezone: true })

@@ -1,43 +1,23 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
-import fontkit from "@pdf-lib/fontkit";
-import { PDFDocument, PDFFont, PDFPage, degrees, rgb } from "pdf-lib";
+import { PDFDocument, StandardFonts, degrees, rgb } from "pdf-lib";
 
-export interface ApprovalReceiptData {
-  orderNumber: string;
-  title: string;
-  vendorName: string;
-  amount: string;
-  currency: string;
-  description?: string | null;
-  requesterName?: string | null;
-  requesterEmail: string;
-  approverName?: string | null;
-  approverEmail: string;
-  decisionNotes?: string | null;
-  approvedAt: Date;
+import { convertOfficeDocumentToPdf } from "@/lib/office-convert";
+
+/** The requester's original quote file, as read back from S3. */
+export interface QuoteFile {
+  bytes: Buffer;
+  fileName: string;
 }
 
 const PAGE_MARGIN = 56;
 const INK = rgb(0.09, 0.11, 0.15);
-const MUTED = rgb(0.42, 0.45, 0.5);
-const ACCENT = rgb(0.11, 0.42, 0.31);
-const RULE = rgb(0.85, 0.86, 0.88);
 
 const STAMP_SIZE = 130;
 const STAMP_ASSET_PATH = path.join(process.cwd(), "public", "sign.png");
 
-// Order fields are free text and routinely contain Hebrew (order titles,
-// vendor names, notes, names) — the built-in Standard 14 fonts only cover
-// WinAnsi (Latin) and throw on anything else, so the receipt embeds a real
-// Hebrew-capable font instead. Alef is a static (non-variable) SIL-licensed
-// font covering Hebrew + Latin + digits in one file — see public/fonts/Alef-OFL.txt.
-const FONT_REGULAR_PATH = path.join(process.cwd(), "public", "fonts", "Alef-Regular.ttf");
-const FONT_BOLD_PATH = path.join(process.cwd(), "public", "fonts", "Alef-Bold.ttf");
-
 let cachedStampBytes: Uint8Array | undefined;
-let cachedFontBytes: { regular: Uint8Array; bold: Uint8Array } | undefined;
 
 /**
  * Loads the "APPROVED" stamp icon once and reuses it for every receipt.
@@ -52,203 +32,127 @@ async function loadStampBytes(): Promise<Uint8Array> {
   return cachedStampBytes;
 }
 
-async function loadFontBytes() {
-  if (!cachedFontBytes) {
-    const [regular, bold] = await Promise.all([
-      readFile(FONT_REGULAR_PATH),
-      readFile(FONT_BOLD_PATH),
-    ]);
-    cachedFontBytes = { regular, bold };
+type QuoteFileKind = "pdf" | "png" | "jpeg" | "office";
+
+/** Derived from the file's extension — content type isn't stored in the DB, and the upload form already restricts extensions to this set (see `ALLOWED_QUOTE_TYPES` in `actions/orders.ts`). */
+function resolveQuoteFileKind(fileName: string): QuoteFileKind {
+  const ext = fileName.toLowerCase().split(".").pop() ?? "";
+  switch (ext) {
+    case "pdf":
+      return "pdf";
+    case "png":
+      return "png";
+    case "jpg":
+    case "jpeg":
+      return "jpeg";
+    case "doc":
+    case "docx":
+    case "xls":
+    case "xlsx":
+      return "office";
+    default:
+      throw new Error(`Can't sign a "${ext}" file — unsupported quote file type.`);
   }
-  return cachedFontBytes;
 }
 
-const HEBREW_RE = /[֑-״]/; // Hebrew block: points, letters, punctuation
+/** US Letter, matching the page size the old generated receipt used. */
+const IMAGE_PAGE_SIZE: [number, number] = [612, 792];
 
-/**
- * pdf-lib's `drawText` always lays out glyphs left-to-right in string
- * order — it doesn't run the Unicode Bidi algorithm. For a string with no
- * Hebrew this is a no-op; for Hebrew (optionally mixed with Latin words or
- * numbers, e.g. "אישור הזמנה #1234") it reverses word order and, within
- * each Hebrew word, character order too, so the RTL reading order comes
- * out right when drawn by an LTR renderer. Numbers/Latin words keep their
- * internal order, matching how they'd actually appear embedded in Hebrew
- * text. This is a simplified stand-in for full bidi reordering, not a
- * spec-accurate implementation — good enough for the short, mostly
- * single-direction strings that make up a purchase order's fields.
- */
-function toVisualOrder(text: string): string {
-  if (!HEBREW_RE.test(text)) return text;
-  const tokens = text.split(/(\s+)/);
-  const visualTokens = tokens.map((token) =>
-    HEBREW_RE.test(token) ? [...token].reverse().join("") : token,
-  );
-  return visualTokens.reverse().join("");
-}
-
-/**
- * Renders the human-readable approval receipt with pdf-lib: order details
- * plus the "APPROVED" stamp icon in place of a cryptographic signature.
- * This is now the full pipeline — there is no separate signing step.
- */
-export async function generateApprovalReceipt(
-  data: ApprovalReceiptData,
-): Promise<Buffer> {
+/** Wraps a standalone image (the requester's quote file) in a one-page PDF, scaled to fit the page without upscaling. */
+async function imageToPdfBytes(bytes: Buffer, kind: "png" | "jpeg"): Promise<Uint8Array> {
   const doc = await PDFDocument.create();
-  doc.registerFontkit(fontkit);
-  doc.setTitle(`Approval Receipt - ${data.orderNumber}`);
-  doc.setSubject("Purchase Order Approval Receipt");
-  doc.setProducer("Procurement Order Management App");
-  doc.setCreationDate(data.approvedAt);
+  const image = kind === "png" ? await doc.embedPng(bytes) : await doc.embedJpg(bytes);
 
-  const page = doc.addPage([612, 792]); // US Letter
-  const fontBytes = await loadFontBytes();
-  const font = await doc.embedFont(fontBytes.regular, { subset: true });
-  const bold = await doc.embedFont(fontBytes.bold, { subset: true });
+  const [pageWidth, pageHeight] = IMAGE_PAGE_SIZE;
+  const maxWidth = pageWidth - PAGE_MARGIN * 2;
+  const maxHeight = pageHeight - PAGE_MARGIN * 2;
+  const scale = Math.min(maxWidth / image.width, maxHeight / image.height, 1);
+  const drawWidth = image.width * scale;
+  const drawHeight = image.height * scale;
 
-  const { width, height } = page.getSize();
-  let cursorY = height - PAGE_MARGIN;
-
-  const writeLine = (
-    text: string,
-    opts: {
-      size?: number;
-      f?: PDFFont;
-      color?: ReturnType<typeof rgb>;
-      gap?: number;
-    } = {},
-  ) => {
-    const size = opts.size ?? 11;
-    page.drawText(toVisualOrder(text), {
-      x: PAGE_MARGIN,
-      y: cursorY,
-      size,
-      font: opts.f ?? font,
-      color: opts.color ?? INK,
-    });
-    cursorY -= size + (opts.gap ?? 10);
-  };
-
-  const rule = () => {
-    page.drawLine({
-      start: { x: PAGE_MARGIN, y: cursorY },
-      end: { x: width - PAGE_MARGIN, y: cursorY },
-      thickness: 1,
-      color: RULE,
-    });
-    cursorY -= 18;
-  };
-
-  const field = (label: string, value: string) => {
-    page.drawText(label.toUpperCase(), {
-      x: PAGE_MARGIN,
-      y: cursorY,
-      size: 8.5,
-      font: bold,
-      color: MUTED,
-    });
-    cursorY -= 13;
-    page.drawText(toVisualOrder(value) || "—", {
-      x: PAGE_MARGIN,
-      y: cursorY,
-      size: 11.5,
-      font,
-      color: INK,
-    });
-    cursorY -= 22;
-  };
-
-  writeLine("PURCHASE ORDER — APPROVAL RECEIPT", {
-    size: 18,
-    f: bold,
-    gap: 4,
-  });
-  writeLine("Procurement Order Management App", {
-    size: 10,
-    color: MUTED,
-    gap: 20,
-  });
-  rule();
-
-  field("Order Number", data.orderNumber);
-  field("Title", data.title);
-  field("Vendor", data.vendorName);
-  field("Amount", `${data.currency} ${data.amount}`);
-  if (data.description) field("Description / Notes", data.description);
-
-  rule();
-  field("Requested By", `${data.requesterName ?? ""} <${data.requesterEmail}>`.trim());
-  field("Approved By", `${data.approverName ?? ""} <${data.approverEmail}>`.trim());
-  field(
-    "Approved At",
-    `${data.approvedAt.toUTCString()}`,
-  );
-  if (data.decisionNotes) field("Approver Notes", data.decisionNotes);
-
-  rule();
-  writeLine("STATUS: APPROVED", { size: 13, f: bold, color: ACCENT, gap: 24 });
-
-  const disclaimer =
-    "This document was generated automatically when the order was approved and " +
-    "reflects the order details and decision on record in the Procurement Order " +
-    "Management App at the time shown above. The approval stamp is a visual " +
-    "marker of that decision, not a cryptographic signature.";
-  drawWrapped(page, disclaimer, {
-    x: PAGE_MARGIN,
-    y: cursorY,
-    maxWidth: width - PAGE_MARGIN * 2 - STAMP_SIZE - 24,
-    size: 8.5,
-    font,
-    color: MUTED,
-    lineHeight: 12,
+  const page = doc.addPage(IMAGE_PAGE_SIZE);
+  page.drawImage(image, {
+    x: (pageWidth - drawWidth) / 2,
+    y: (pageHeight - drawHeight) / 2,
+    width: drawWidth,
+    height: drawHeight,
   });
 
-  // Stamp the "APPROVED" icon in the bottom-right corner, anchored to the
-  // page rather than the text cursor above, and slightly rotated so it
-  // reads like a physical rubber stamp rather than a pasted image.
+  return doc.save();
+}
+
+/** Converts the requester's quote file to PDF bytes if it isn't one already. PDFs pass through untouched. */
+async function ensurePdfBytes(quoteFile: QuoteFile): Promise<Uint8Array | Buffer> {
+  const kind = resolveQuoteFileKind(quoteFile.fileName);
+  switch (kind) {
+    case "pdf":
+      return quoteFile.bytes;
+    case "png":
+    case "jpeg":
+      return imageToPdfBytes(quoteFile.bytes, kind);
+    case "office":
+      return convertOfficeDocumentToPdf(quoteFile.bytes);
+  }
+}
+
+/**
+ * Builds the approval receipt by stamping the requester's own quote file —
+ * not a freshly generated document. The file is converted to PDF first if
+ * it isn't one already (image → single-page PDF; Word/Excel → PDF via
+ * LibreOffice, see `office-convert.ts`), then the "APPROVED" stamp icon and
+ * the sign-off date are drawn onto the last page, bottom-right, so the
+ * receipt is visibly the same file the requester submitted.
+ */
+export async function stampApprovalOnQuoteFile(
+  quoteFile: QuoteFile,
+  approvedAt: Date,
+): Promise<Buffer> {
+  const pdfBytes = await ensurePdfBytes(quoteFile);
+  const doc = await PDFDocument.load(pdfBytes, { ignoreEncryption: true });
+  doc.setModificationDate(approvedAt);
+
   const stampBytes = await loadStampBytes();
   const stampImage = await doc.embedPng(stampBytes);
+
+  // The sign-off date is a plain ASCII string (Date#toUTCString), so a
+  // Standard-14 font is enough here — no need for a Hebrew-capable font
+  // like the old fully-generated receipt used.
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+
+  const pages = doc.getPages();
+  const page = pages[pages.length - 1];
+  const { width, height } = page.getSize();
+
+  // The stamp size below assumes a normal invoice/PO page. Client-uploaded
+  // PDFs aren't guaranteed to be that big (unlike the old fully-generated
+  // receipt, which always drew its own US Letter page), so shrink the stamp
+  // to fit rather than letting it run off an unusually small page.
+  const stampSize = Math.max(36, Math.min(STAMP_SIZE, width - PAGE_MARGIN, height - PAGE_MARGIN));
+  const stampX = Math.max(4, width - PAGE_MARGIN - stampSize + 20);
+  const stampY = Math.max(4, Math.min(PAGE_MARGIN + 34, height - stampSize - 16));
+
+  // Slightly rotated so it reads like a physical rubber stamp rather than
+  // a pasted image.
   page.drawImage(stampImage, {
-    x: width - PAGE_MARGIN - STAMP_SIZE + 20,
-    y: PAGE_MARGIN + 20,
-    width: STAMP_SIZE,
-    height: STAMP_SIZE,
+    x: stampX,
+    y: stampY,
+    width: stampSize,
+    height: stampSize,
     rotate: degrees(-12),
     opacity: 0.92,
   });
 
+  const dateLabel = `Signed ${approvedAt.toUTCString()}`;
+  const dateSize = 9;
+  const dateWidth = font.widthOfTextAtSize(dateLabel, dateSize);
+  page.drawText(dateLabel, {
+    x: stampX + stampSize / 2 - dateWidth / 2,
+    y: Math.max(4, stampY - 16),
+    size: dateSize,
+    font,
+    color: INK,
+  });
+
   const bytes = await doc.save();
   return Buffer.from(bytes);
-}
-
-function drawWrapped(
-  page: PDFPage,
-  text: string,
-  opts: {
-    x: number;
-    y: number;
-    maxWidth: number;
-    size: number;
-    font: PDFFont;
-    color: ReturnType<typeof rgb>;
-    lineHeight: number;
-  },
-) {
-  const words = text.split(" ");
-  let line = "";
-  let y = opts.y;
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    const candidateWidth = opts.font.widthOfTextAtSize(candidate, opts.size);
-    if (candidateWidth > opts.maxWidth && line) {
-      page.drawText(line, { x: opts.x, y, size: opts.size, font: opts.font, color: opts.color });
-      line = word;
-      y -= opts.lineHeight;
-    } else {
-      line = candidate;
-    }
-  }
-  if (line) {
-    page.drawText(line, { x: opts.x, y, size: opts.size, font: opts.font, color: opts.color });
-  }
 }

@@ -9,14 +9,20 @@ export default async function LoginPage({
   searchParams,
 }: PageProps<"/login">) {
   const { callbackUrl } = await searchParams;
-  const target = typeof callbackUrl === "string" ? callbackUrl : "/orders";
+  const requestedTarget = typeof callbackUrl === "string" ? callbackUrl : undefined;
 
   const session = await auth();
   if (session?.user) {
-    redirect(target);
+    // Honor an explicit callbackUrl (e.g. proxy.ts sent them here trying to
+    // reach a specific page); otherwise default by role — approvers to
+    // their queue, everyone else to their own orders.
+    redirect(requestedTarget ?? (session.user.isApprover ? "/approvals" : "/orders"));
   }
 
-  const boundSignIn = signInWithGoogle.bind(null, target);
+  // Not signed in yet, so role isn't known until after the OAuth
+  // round-trip — fall back to "/", which does the role-based redirect
+  // once there's a session to check.
+  const boundSignIn = signInWithGoogle.bind(null, requestedTarget ?? "/");
 
   return (
     <div className="mx-auto flex max-w-sm flex-col items-center py-16">

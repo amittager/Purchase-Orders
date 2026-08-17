@@ -10,6 +10,15 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: path.join(__dirname),
   },
+  experimental: {
+    serverActions: {
+      // Server Actions cap request bodies at 1MB by default — too small
+      // for the quote-file upload in createOrder (actions/orders.ts),
+      // which allows up to 15MB (MAX_FILE_BYTES). Matches that limit with
+      // a little headroom for the rest of the multipart form.
+      bodySizeLimit: "16mb",
+    },
+  },
 };
 
 export default nextConfig;

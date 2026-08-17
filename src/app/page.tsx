@@ -9,10 +9,16 @@ import { auth } from "@/lib/auth";
 export default async function HomePage() {
   const session = await auth();
   if (session?.user) {
-    redirect("/orders");
+    // Approvers land on their queue, not their own order history — that's
+    // what they're here to act on.
+    redirect(session.user.isApprover ? "/approvals" : "/orders");
   }
 
-  const boundSignIn = signInWithGoogle.bind(null, "/orders");
+  // Not signed in yet, so approver status isn't known until after the OAuth
+  // round-trip completes — send them back here (default, no callbackUrl)
+  // and let the branch above do the role-based redirect once there's a
+  // session to check.
+  const boundSignIn = signInWithGoogle.bind(null, "/");
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col items-center gap-8 py-12 text-center">

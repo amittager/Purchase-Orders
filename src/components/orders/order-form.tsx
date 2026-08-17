@@ -1,7 +1,7 @@
 "use client";
 
-import { AlertCircle, Loader2, UploadCloud } from "lucide-react";
-import { useActionState } from "react";
+import { AlertCircle, CheckCircle2, Loader2, UploadCloud } from "lucide-react";
+import { useActionState, useState } from "react";
 import { useFormStatus } from "react-dom";
 
 import { Button } from "@/components/ui/button";
@@ -16,14 +16,30 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { createOrder, type CreateOrderState } from "@/lib/actions/orders";
+import {
+  createOrder,
+  requestQuoteUploadUrl,
+  type CreateOrderState,
+} from "@/lib/actions/orders";
 
 const CURRENCIES = ["USD", "EUR", "GBP", "ILS", "CAD", "AUD"];
 
-function SubmitButton() {
+/**
+ * The quote file is uploaded straight to S3 as soon as it's picked (see
+ * `handleFileChange` below), independently of the form's own submit —
+ * `createOrder` only ever receives the resulting key/name as hidden fields,
+ * never the file bytes. Keeps large uploads off this app's server entirely.
+ */
+type QuoteUploadState =
+  | { status: "idle" }
+  | { status: "uploading"; fileName: string }
+  | { status: "done"; orderId: string; quoteFileKey: string; fileName: string }
+  | { status: "error"; message: string };
+
+function SubmitButton({ disabled }: { disabled?: boolean }) {
   const { pending } = useFormStatus();
   return (
-    <Button type="submit" disabled={pending} className="w-full sm:w-auto">
+    <Button type="submit" disabled={disabled || pending} className="w-full sm:w-auto">
       {pending && <Loader2 className="size-4 animate-spin" />}
       Submit Purchase Order
     </Button>
@@ -40,6 +56,55 @@ export function OrderForm() {
     createOrder,
     undefined,
   );
+  const [quoteUpload, setQuoteUpload] = useState<QuoteUploadState>({ status: "idle" });
+
+  async function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      setQuoteUpload({ status: "idle" });
+      return;
+    }
+
+    setQuoteUpload({ status: "uploading", fileName: file.name });
+    try {
+      const result = await requestQuoteUploadUrl({
+        fileName: file.name,
+        fileSize: file.size,
+        contentType: file.type || undefined,
+      });
+      if ("error" in result) {
+        setQuoteUpload({ status: "error", message: result.error });
+        return;
+      }
+
+      const upload = await fetch(result.uploadUrl, {
+        method: "PUT",
+        body: file,
+        // uploadHeaders (x-amz-server-side-encryption) must be sent
+        // verbatim — the presigned URL's signature requires it, see
+        // getUploadUrl in lib/s3.ts.
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          ...result.uploadHeaders,
+        },
+      });
+      if (!upload.ok) {
+        setQuoteUpload({ status: "error", message: "Upload to storage failed. Please try again." });
+        return;
+      }
+
+      setQuoteUpload({
+        status: "done",
+        orderId: result.orderId,
+        quoteFileKey: result.quoteFileKey,
+        fileName: file.name,
+      });
+    } catch {
+      setQuoteUpload({ status: "error", message: "Upload failed. Please try again." });
+    }
+  }
+
+  const canSubmit = quoteUpload.status === "done";
 
   return (
     <Card>
@@ -120,20 +185,56 @@ export function OrderForm() {
 
           <div className="space-y-1.5">
             <Label htmlFor="quoteFile">Price quote / specification</Label>
+            {/* No `name` attribute — this file never travels with the form
+                submit. It's uploaded straight to S3 on selection (see
+                handleFileChange); orderId/quoteFileKey/quoteFileName below
+                are what actually reach createOrder. */}
             <Input
               id="quoteFile"
-              name="quoteFile"
               type="file"
               required
               accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx"
+              onChange={handleFileChange}
             />
-            <p className="flex items-center gap-1 text-xs text-muted-foreground">
-              <UploadCloud className="size-3.5" />
-              PDF, Word, Excel, or image — up to 15 MB.
-            </p>
+            <input type="hidden" name="orderId" value={quoteUpload.status === "done" ? quoteUpload.orderId : ""} />
+            <input
+              type="hidden"
+              name="quoteFileKey"
+              value={quoteUpload.status === "done" ? quoteUpload.quoteFileKey : ""}
+            />
+            <input
+              type="hidden"
+              name="quoteFileName"
+              value={quoteUpload.status === "done" ? quoteUpload.fileName : ""}
+            />
+
+            {quoteUpload.status === "uploading" && (
+              <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" />
+                Uploading {quoteUpload.fileName}…
+              </p>
+            )}
+            {quoteUpload.status === "done" && (
+              <p className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
+                <CheckCircle2 className="size-3.5" />
+                {quoteUpload.fileName} uploaded.
+              </p>
+            )}
+            {quoteUpload.status === "error" && (
+              <p className="flex items-center gap-1 text-xs text-destructive">
+                <AlertCircle className="size-3.5" />
+                {quoteUpload.message}
+              </p>
+            )}
+            {quoteUpload.status === "idle" && (
+              <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                <UploadCloud className="size-3.5" />
+                PDF, Word, Excel, or image — up to 15 MB.
+              </p>
+            )}
           </div>
 
-          <SubmitButton />
+          <SubmitButton disabled={!canSubmit} />
         </form>
       </CardContent>
     </Card>
